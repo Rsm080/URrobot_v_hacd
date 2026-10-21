@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# V-HACD 凸分解缓存（可由程序重新生成，体积大且与参数绑定）
+distance_matrix_out/cache/
+*.vhacd.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
