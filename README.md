@@ -425,3 +425,58 @@ wc -l distance_matrix_out/*.csv
 python link_piece_distance_matrix.py --obstacle-pos 0,0,0.05 --samples 5 --out-dir /tmp/lpdm_pen
 ```
 
+---
+
+## 11. 凸包运动可视化（`view_convex_trajectory.py`）
+
+测距脚本只给数字，`view_convex_trajectory.py` 专门用来看：
+把每个 link 的 collision 拆成凸块（和 `link_piece_distance_matrix.py` 共用同一份
+`distance_matrix_out/cache`，不会重复跑 V-HACD），沿轨迹逐帧摆动，并画出扫过的轨迹。
+
+### 11.1 看什么
+
+| 元素 | 参数 | 说明 |
+| --- | --- | --- |
+| 凸块本体 | `--piece-alpha` | 按连杆上色（颜色固定，换机器人也稳定） |
+| 原始网格 | `--robot-mode ghost/hide/visual`、`--robot-alpha` | 半透明底图，用来看 V-HACD 分块贴不贴合原网格 |
+| 残影 | `--ghosts 6`、`--ghost-alpha` | 整周期若干时刻的凸包"定影"，看扫过的体积 |
+| 轨迹线 | `--trail link/piece/none`、`--trail-width` | 连杆原点 / 凸块质心的折线（点太多会自动抽稀） |
+| 末端轨迹 | `--ee-trail`、`--ee-link` | 自动找 `ee_link` / `tool0` / `tcp`… |
+| 动坐标系 | `--axes 0.06` | 每帧在末端画 RGB 轴，看姿态变化 |
+
+### 11.2 常用命令
+
+```bash
+# 默认：UR5 + 正弦摆动，带残影 + 连杆轨迹线
+python view_convex_trajectory.py
+
+# 换机器人：只改 --urdf；幅值按各自行程自动取 40%，不用调参数
+python view_convex_trajectory.py --urdf ../other_robot.urdf --amp-frac 0.4
+
+# UR5 更自然的弯臂姿态 + 慢放 + 凸块质心轨迹
+python view_convex_trajectory.py --home 0,-1.2,1.2,-1.57,-1.57,0 --cycle-seconds 25 --trail piece
+
+# 回放测距时的运动（distances.npz 里存了 joint_names / joint_positions）
+python view_convex_trajectory.py --traj distance_matrix_out/distances.npz
+
+# 导出轨迹 -> 以后用 --traj 原样回放
+python view_convex_trajectory.py --headless --save-traj /tmp/traj.csv
+python view_convex_trajectory.py --traj /tmp/traj.csv
+```
+
+### 11.3 换机器人要注意的三件事
+
+1. `--urdf` 里的 `<mesh filename>` 必须是相对 URDF 的路径（PyBullet 不认 `package://`）；
+2. 关节数、限位、mimic 全从 URDF 读，**不需要**改代码；基准位姿缺省是每个关节
+   `clamp(0, lower, upper)`，想摆成别的样子用 `--home`（个数 = 可动关节数，不含夹爪）；
+3. 夹爪/末端关节自动识别为"mimic 的父关节"或名字带 `finger`/`knuckle` 的关节，
+   由 `--gripper cycle/open/closed` 驱动，其余关节做正弦摆动。
+
+### 11.4 自检（无显示器 / CI）
+
+```bash
+python -m py_compile view_convex_trajectory.py
+# 应打印 19 个连杆 / 23 个凸块，并给出每个连杆原点的轨迹包围盒与路程
+python view_convex_trajectory.py --headless --samples 24
+```
+
