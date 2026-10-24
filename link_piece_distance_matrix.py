@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """连杆凸块 -> 障碍物的最小距离（机器人规则运动 + 场景中的立体障碍物）。
 
+默认末端执行器是"铣削电主轴 + Ø10 立铣刀"（URDF/ur5_spindle.urdf）：
+ee_link 之后是 spindle_mount_link -> spindle_link -> tool_link，三个关节都是 fixed，
+网格由 make_spindle_meshes.py 生成。想换回原来的 Robotiq 2F-140 夹爪，只要
+`--urdf URDF/ur5_robotiq_140.urdf`（下面提到 finger_joint / mimic 的逻辑只在夹爪模型上生效）。
+
 距离定义
 --------
 只算 "机器人自己 vs 障碍物"，不再计算机器人本体各连杆之间的距离
@@ -16,15 +21,17 @@
 
 处理流程
 --------
-1. 解析 URDF，取每个 link 的 <collision>（ur5 是 STL，robotiq 是 STL + 少量 box）；
+1. 解析 URDF，取每个 link 的 <collision>（ur5 是 STL，夹爪是 STL + 少量 box，
+   电主轴/铣刀是 make_spindle_meshes.py 生成的 STL）；
 2. 每个碰撞网格做凸分解：
      - 已经凸的（volume/hull_volume >= --convex-ratio）直接用它的凸包；
      - 凹的用 p.vhacd() 切成若干凸块（缓存到 out/cache，可 --recompute 重算）；
      - box 直接展开成 8 个角点（本身就是一个凸块）；
 3. 每个凸块写成独立 OBJ（已变换到 link 坐标系），再用 GEOM_MESH 建成独立静态刚体
    （collisionMargin=0，保证测距精确）；障碍物是一个 box 刚体（凸的，1 块）；
-4. 按规则运动：q_k(t) = home_k + amp*sin(2*pi*freq*t + k*phase_step)，夹爪按
-   finger_joint 的 mimic 关系联动；每个采样点用 FK 把凸块刚体摆到 link 的世界位姿；
+4. 按规则运动：q_k(t) = home_k + amp*sin(2*pi*freq*t + k*phase_step)；URDF 里
+   有 finger_joint（夹爪）时再按 mimic 关系联动，没有就只动手臂；每个采样点用 FK
+   把凸块刚体摆到 link 的世界位姿；
 5. 用 p.getClosestPoints() 只测 "凸块 <-> 障碍物"，得到 S 个 N 维距离向量；
 6. 输出 pieces.csv / piece_distance_to_obstacle.csv / link_distance_to_obstacle.csv /
    piece_distances_all_samples.csv / distances.npz，并在控制台打印每个连杆到障碍物
@@ -67,7 +74,10 @@ import pybullet as p
 from scipy.spatial import ConvexHull
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_URDF = ROOT / "URDF" / "ur5_robotiq_140.urdf"
+# 默认末端执行器：铣削电主轴 + Ø10 立铣刀（网格由 make_spindle_meshes.py 生成）
+DEFAULT_URDF = ROOT / "URDF" / "ur5_spindle.urdf"
+# 旧的末端：Robotiq 2F-140 夹爪（要算夹爪开合时用 --urdf 指到它）
+GRIPPER_URDF = ROOT / "URDF" / "ur5_robotiq_140.urdf"
 
 
 def log(msg: str = "") -> None:
@@ -411,9 +421,33 @@ def create_piece_bodies(pieces: list[Piece]) -> None:
 # ---------------------------------------------------------------------------
 # 规则运动
 # ---------------------------------------------------------------------------
+# 末端执行器上"自己会动"的关节名关键字：夹爪手指/指节、电主轴夹头、铣刀轴……
+EE_JOINT_KEYWORDS = ("finger", "knuckle", "spindle", "collet", "chuck", "mill", "cutter", "tool")
+
+
 def is_gripper_joint(name: str) -> bool:
+    """末端执行器自己的关节（不算"手臂关节"）。
+
+    本仓库默认的电主轴 + 铣刀全是 fixed 关节，一个都匹配不到；但换成带夹头/换刀轴
+    的模型时，这些关节绝不能混进手臂正弦摆动（否则 --home 的 6 个值就对不上了）。
+    """
     low = name.lower()
-    return "finger" in low or "knuckle" in low
+    return any(k in low for k in EE_JOINT_KEYWORDS)
+
+
+def link_chain(joints, root: str) -> list[str]:
+    """root 之后（下游）所有 link 的名字，按 BFS 顺序；用来旁白末端工具链。"""
+    children: dict[str, list[str]] = {}
+    for j in joints:
+        children.setdefault(j.parent, []).append(j.child)
+    out: list[str] = []
+    queue = [root]
+    while queue:
+        for child in children.get(queue.pop(0), []):
+            if child not in out:
+                out.append(child)
+                queue.append(child)
+    return out
 
 
 class Motion:
@@ -607,10 +641,12 @@ def parse_floats(text: str) -> list[float]:
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        description="计算 UR5 + Robotiq 各连杆凸块之间的最小距离矩阵（含规则运动与立体障碍物）",
+        description="计算 UR5 + 末端执行器（默认电主轴 + 铣刀，也可换 Robotiq 夹爪）各连杆凸块"
+                    "之间的最小距离矩阵（含规则运动与立体障碍物）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--urdf", default=str(DEFAULT_URDF), help="URDF 路径")
+    ap.add_argument("--urdf", default=str(DEFAULT_URDF),
+                    help=f"URDF 路径；默认电主轴 + 铣刀，夹爪模型用 {GRIPPER_URDF}")
     ap.add_argument("--out-dir", default=str(ROOT / "distance_matrix_out"), help="输出目录")
     ap.add_argument("--samples", type=int, default=30, help="一个运动周期内的采样点数")
     ap.add_argument("--home", type=parse_floats, default="0,-1.2,1.2,-1.57,-1.57,0",
@@ -618,7 +654,8 @@ def parse_args(argv=None):
     ap.add_argument("--amp", type=float, default=0.35, help="正弦幅值 (rad)")
     ap.add_argument("--freq", type=float, default=1.0, help="一个采样周期内的正弦周期数")
     ap.add_argument("--phase-step", type=float, default=60.0, help="相邻手臂关节的相位差 (deg)")
-    ap.add_argument("--gripper", choices=["cycle", "open", "closed"], default="cycle", help="夹爪运动方式")
+    ap.add_argument("--gripper", choices=["cycle", "open", "closed"], default="cycle",
+                    help="夹爪运动方式（URDF 里没有夹爪关节时无效，例如电主轴）")
     ap.add_argument("--max-distance", type=float, default=5.0, help="测距上限，更远的距离记为该值 (m)")
     ap.add_argument("--convex-ratio", type=float, default=0.99,
                     help="mesh 体积/凸包体积 >= 该值时视为已经凸，不再 V-HACD")
@@ -750,8 +787,15 @@ def main(argv=None) -> int:
         log("[运动] 手臂关节: " + ", ".join(j.name for j in motion.arm))
         log(f"       q_k(t) = home_k + {args.amp} * sin(2*pi*{args.freq}*t + k*{args.phase_step}deg), "
             f"t = 0..1 均匀取 {max(1, args.samples)} 点")
+        ee_links = link_chain(joints, "ee_link")
+        if ee_links:
+            n_ee = sum(counts.get(ln, 0) for ln in ee_links)
+            log(f"[末端] ee_link 下游（固定工具）: {', '.join(ee_links)}（{n_ee} 个凸块）")
         if motion.finger:
             log(f"       夹爪: {args.gripper}（{motion.finger} + {len(motion.mimic)} 个 mimic 关节联动）")
+        else:
+            log(f"       末端没有可开合的夹爪关节，--gripper {args.gripper} 不生效"
+                f"（要算夹爪开合请 --urdf {GRIPPER_URDF.name}）")
 
         if args.gui:
             p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)

@@ -12,6 +12,15 @@
   方便换机器人后检查 V-HACD 的分块是否贴合原网格；
 * 一次把整个周期的若干时刻 "定影" 成半透明残影（--ghosts），
   再画连杆原点 / 凸块质心的轨迹线（--trail），一眼能看出扫过的空间；
+* 整机会自动抬高（--clearance），保证正弦摆动的最低点不会穿到地面以下，
+  相机也按整段扫掠范围自动取景，所以整个摆动都看得见；抬高后底座会悬空，
+  默认画一个灰色线框支架到地面（--no-pedestal 去掉），想再抬高加 --lift；
+* 静止不动的凸块（基座、绕自身轴转的圆柱…）不会生成残影，否则几份半透明
+  残影叠在同一个位置，会糊成一根看着很奇怪的"柱子"；
+* 夹爪"张开 / 闭合"对应哪个关节值，运行时用指尖间距实测标定（不同 URDF 的
+  正负约定不一样），默认从张开开始，不是一上来就合拢；
+* --labels 在每个连杆上标出名字，--hide link1,link2 可以把指定连杆的凸块藏掉，
+  用来确认"画面里这块到底是什么"；
 * 关节数量、限位、mimic、夹爪全部从 URDF 读，换机器人只改 --urdf。
 
 复用关系
@@ -86,6 +95,9 @@ PALETTE: list[tuple[float, float, float]] = [
 EE_CANDIDATES = ("ee_link", "tool0", "tcp", "flange", "end_effector_link",
                  "gripper_link", "tool_frame", "palm")
 
+# 自动取景的默认视角（distance,yaw,pitch,target_x,target_y,target_z）
+CAMERA_DEFAULT = [1.8, 50.0, -22.0, 0.3, 0.0, 0.3]
+
 
 def link_colors(link_order: list[str]) -> dict[str, tuple[float, float, float]]:
     return {name: PALETTE[i % len(PALETTE)] for i, name in enumerate(link_order)}
@@ -108,6 +120,42 @@ def zero_pose(joint) -> float:
 def rot_matrix(quat) -> np.ndarray:
     return np.asarray(p.getMatrixFromQuaternion([float(x) for x in quat]),
                       dtype=np.float64).reshape(3, 3)
+
+
+def joint_children(robot) -> dict[int, list[int]]:
+    """关节的父子关系（-1 = 基座），用来划出夹爪子树。"""
+    children: dict[int, list[int]] = {}
+    for i in range(p.getNumJoints(robot)):
+        children.setdefault(int(p.getJointInfo(robot, i)[16]), []).append(i)
+    return children
+
+
+def gripper_span(robot, root_joints: list[int]) -> float:
+    """夹爪张开度：夹爪这几串关节最末端连杆（指尖）之间的最大距离。
+
+    张开时左右两指分开 -> 变大，闭合时靠拢 -> 变小，和关节值正负约定无关。
+    """
+    if not root_joints:
+        return 0.0
+    children = joint_children(robot)
+    stack = [j for r in root_joints for j in children.get(r, [])]
+    joints: list[int] = []
+    seen: set[int] = set()
+    while stack:
+        j = stack.pop()
+        if j in seen:
+            continue
+        seen.add(j)
+        joints.append(j)
+        stack.extend(children.get(j, []))
+    leaves = [j for j in joints if not children.get(j)]
+    picks = leaves if len(leaves) >= 2 else joints
+    if len(picks) < 2:
+        return 0.0
+    pts = [np.asarray(p.getLinkState(robot, j, computeForwardKinematics=True)[4],
+                      dtype=np.float64) for j in picks]
+    return float(max(np.linalg.norm(a - b)
+                     for i, a in enumerate(pts) for b in pts[i + 1:]))
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +193,8 @@ class Motion:
             raise RuntimeError("所有可动关节都被 mimic 驱动，没法单独摆姿势")
 
         self.gripper = args.gripper
+        self.grip_open: float | None = None       # 标定后才知道（calibrate_gripper）
+        self.grip_closed: float | None = None
         self.freq = float(args.freq)
         self.phase = math.radians(float(args.phase_step))
         self.home = self._home(args)
@@ -254,18 +304,68 @@ class Motion:
 
     # -- 采样 -------------------------------------------------------------
     def _gripper_cfg(self, cfg: dict[str, float], t: float) -> None:
+        """夹爪取值：张开 / 闭合两端由 calibrate_gripper() 标定，cycle 从 "张开" 开始。"""
         if self.leader is None:
             return
-        joint = self.by_name[self.leader]
-        lim = joint_limits(joint)
-        lo, hi = lim if lim is not None else (0.0, 0.7)
+        open_v, closed_v = self._grip_limits()
         if self.gripper == "cycle":
-            frac = 0.5 * (1.0 - math.cos(2.0 * math.pi * self.freq * t))
-            cfg[self.leader] = float(lo + frac * (hi - lo))
-        elif self.gripper == "closed":
-            cfg[self.leader] = float(hi)
+            frac = 0.5 * (1.0 + math.cos(2.0 * math.pi * self.freq * t))
+            cfg[self.leader] = float(closed_v + frac * (open_v - closed_v))
+        elif self.gripper == "open":
+            cfg[self.leader] = float(open_v)
         else:
-            cfg[self.leader] = float(lo)
+            cfg[self.leader] = float(closed_v)
+
+    def _grip_limits(self) -> tuple[float, float]:
+        """(张开值, 闭合值)；还没标定时退回 (lower, upper)。"""
+        if self.grip_open is not None and self.grip_closed is not None:
+            return float(self.grip_open), float(self.grip_closed)
+        lim = joint_limits(self.by_name[self.leader])
+        return lim if lim is not None else (0.0, 0.7)
+
+    def _gripper_roots(self, joint_index: dict[str, int]) -> list[int]:
+        """leader 以及所有（间接）mimic 它的关节：夹爪真正会动的那几串关节。"""
+        if self.leader is None:
+            return []
+        seen = {self.leader}
+        changed = True
+        while changed:
+            changed = False
+            for child, (parent, _mult, _offset) in self.mimic.items():
+                if parent in seen and child not in seen:
+                    seen.add(child)
+                    changed = True
+        return [joint_index[n] for n in seen if n in joint_index]
+
+    def calibrate_gripper(self, robot, joint_index: dict[str, int]) -> None:
+        """实测 "张开 / 闭合" 各是哪个关节值：指尖间距大的那一端算张开。
+
+        不同 URDF 的正负约定完全不一样（本仓库的 Robotiq 140 恰好 0=张开、
+        0.7=闭合），所以不能猜，直接摆两个极端量一下夹爪子树的张开度。
+        """
+        if self.leader is None:
+            return
+        lim = joint_limits(self.by_name[self.leader])
+        if lim is None:
+            log(f"[夹爪] {self.leader} 没有 limit，按 0..0.7 处理")
+            return
+        lo, hi = lim
+        roots = self._gripper_roots(joint_index)
+        spans: dict[float, float] = {}
+        for value in (lo, hi, 0.5 * (lo + hi)):
+            cfg = {self.leader: float(value)}
+            self._fill_mimic(cfg)
+            apply_config(robot, cfg, joint_index)
+            spans[value] = gripper_span(robot, roots)
+        self.grip_open, self.grip_closed = (lo, hi) if spans[lo] >= spans[hi] else (hi, lo)
+        log(f"[夹爪] {self.leader}: 张开={self.grip_open:+.3f}"
+            f"（指尖间距 {spans[self.grip_open]:.3f} m），"
+            f"闭合={self.grip_closed:+.3f}（{spans[self.grip_closed]:.3f} m）")
+        if self.traj_q is not None:
+            log("       回放外部轨迹，夹爪值由轨迹文件决定（--gripper 不生效）")
+        else:
+            log("       起始位姿 t=0 -> "
+                + ("张开" if self.gripper in ("cycle", "open") else "闭合"))
 
     def _fill_mimic(self, cfg: dict[str, float], only_missing: bool = False) -> None:
         for _ in range(max(1, len(self.mimic))):        # 支持 mimic 套 mimic
@@ -379,21 +479,101 @@ def apply_config(robot, cfg: dict[str, float], joint_index: dict[str, int]) -> N
             p.resetJointState(robot, idx, float(value))
 
 
+def link_world_pose(robot, link_index: int | None, cache: dict | None = None):
+    """连杆的世界位姿 (pos, quat)；-1 = 基座，None = 这个 link 在 PyBullet 里没有。"""
+    if link_index is None:
+        return None
+    if link_index == -1:
+        return p.getBasePositionAndOrientation(robot)
+    if cache is not None and link_index in cache:
+        return cache[link_index]
+    st = p.getLinkState(robot, link_index, computeForwardKinematics=True)
+    pose = (st[4], st[5])
+    if cache is not None:
+        cache[link_index] = pose
+    return pose
+
+
+def piece_vertices(pieces) -> list[np.ndarray]:
+    """每个凸块在 link 坐标系下的顶点（凸包 OBJ 里只有 v/f，读一次就够）。"""
+    out = []
+    for pc in pieces:
+        verts, _ = lpdm.read_obj(pc.obj)
+        out.append(np.asarray(verts, dtype=np.float64).reshape(-1, 3))
+    return out
+
+
+def swept_bounds(robot, pieces, joint_index, configs, vertices) -> tuple[np.ndarray, np.ndarray]:
+    """整段轨迹里所有凸块顶点扫过的世界包围盒（自动抬高 / 自动取景都用它）。"""
+    lo = np.full(3, np.inf)
+    hi = np.full(3, -np.inf)
+    for cfg in configs:
+        apply_config(robot, cfg, joint_index)
+        cache: dict = {}
+        for verts, pc in zip(vertices, pieces):
+            pose = link_world_pose(robot, pc.link_index, cache)
+            if pose is None or len(verts) == 0:
+                continue
+            world = verts @ rot_matrix(pose[1]).T + np.asarray(pose[0], dtype=np.float64)
+            lo = np.minimum(lo, world.min(axis=0))
+            hi = np.maximum(hi, world.max(axis=0))
+    return lo, hi
+
+
+def lift_robot(robot, lo: np.ndarray, clearance: float, extra: float) -> float:
+    """把整机沿 +z 抬起，让摆动最低点离地 >= clearance；返回实际抬高量 (m)。
+
+    基座是 fixed base，直接改基座位姿就行，整条运动链会一起上去。
+    """
+    if not np.all(np.isfinite(lo)):
+        return 0.0
+    need = max(0.0, float(clearance) - float(lo[2])) + max(0.0, float(extra))
+    if need <= 1e-9:
+        return 0.0
+    pos, orn = p.getBasePositionAndOrientation(robot)
+    p.resetBasePositionAndOrientation(robot, [pos[0], pos[1], pos[2] + need], orn)
+    return need
+
+
+def auto_camera(lo: np.ndarray, hi: np.ndarray) -> list[float]:
+    """按扫掠包围盒自动取景：distance,yaw,pitch,target_x,target_y,target_z。
+
+    取景距离按包围盒对角线缩放，保证整段摆动的最高点 / 最低点 / 最远点都在画面里。
+    """
+    if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(hi))):
+        return CAMERA_DEFAULT
+    lo = np.asarray(lo, dtype=np.float64)
+    hi = np.asarray(hi, dtype=np.float64)
+    center = 0.5 * (lo + hi)
+    radius = 0.5 * float(np.linalg.norm(hi - lo))
+    dist = float(min(max(1.85 * radius, 0.55), 12.0))
+    return [dist, CAMERA_DEFAULT[1], CAMERA_DEFAULT[2],
+            float(center[0]), float(center[1]), float(center[2])]
+
+
+def draw_pedestal(base_pos, radius: float = 0.09, color=(0.55, 0.58, 0.62)) -> None:
+    """抬高后底座悬空：画个灰色线框 "支架" 到地面，纯参考线（不参与碰撞）。"""
+    x, y, z = [float(v) for v in base_pos]
+    if z <= 1e-6:
+        return
+    corners = [(x + dx, y + dy) for dx, dy in ((radius, radius), (radius, -radius),
+                                               (-radius, -radius), (-radius, radius))]
+    rgb = [float(c) for c in color]
+    for cx, cy in corners:
+        p.addUserDebugLine([cx, cy, 0.0], [cx, cy, z], rgb, lineWidth=1.5, lifeTime=0)
+    for a, b in zip(corners, corners[1:] + corners[:1]):
+        p.addUserDebugLine([a[0], a[1], 0.0], [b[0], b[1], 0.0], rgb, lineWidth=1.5, lifeTime=0)
+        p.addUserDebugLine([a[0], a[1], z], [b[0], b[1], z], rgb, lineWidth=1.5, lifeTime=0)
+
+
 def place_pieces(robot, pieces, bodies) -> None:
     """把凸块刚体摆到各自连杆的当前世界位姿（凸块 OBJ 已经在 link 坐标系里）。"""
-    base_pos, base_orn = p.getBasePositionAndOrientation(robot)
-    link_poses: dict[int, tuple] = {}
+    cache: dict = {}
     for pc, body in zip(pieces, bodies):
-        if pc.link_index is None:
+        pose = link_world_pose(robot, pc.link_index, cache)
+        if pose is None:
             continue
-        if pc.link_index == -1:
-            pos, orn = base_pos, base_orn
-        else:
-            if pc.link_index not in link_poses:
-                st = p.getLinkState(robot, pc.link_index, computeForwardKinematics=True)
-                link_poses[pc.link_index] = (st[4], st[5])
-            pos, orn = link_poses[pc.link_index]
-        p.resetBasePositionAndOrientation(body, pos, orn)
+        p.resetBasePositionAndOrientation(body, pose[0], pose[1])
 
 
 def style_robot(robot, mode: str, alpha: float) -> None:
@@ -501,8 +681,13 @@ def pick_ee_link(explicit: str | None, link_names: list[str], link_index: dict[s
     return name, link_index[name]
 
 
-def build_ghosts(robot, pieces, joint_index, colors, motion, args) -> list[list[int]]:
-    """把整个周期的 N 个时刻各 "定影" 一份半透明凸包，用来反映扫过的体积。"""
+def build_ghosts(robot, pieces, joint_index, colors, motion, args,
+                 vertices=None, skip_links=()) -> list[list[int]]:
+    """把整个周期的 N 个时刻各 "定影" 一份半透明凸包，用来反映扫过的体积。
+
+    整个周期几乎不动的凸块（基座、绕自身轴转的圆柱…）只画当前帧那一份：
+    否则 N 份半透明网格叠在同一处，会在基座旁边糊出一根深色的 "柱子"。
+    """
     count = int(args.ghosts)
     if count <= 0:
         return []
@@ -512,15 +697,97 @@ def build_ghosts(robot, pieces, joint_index, colors, motion, args) -> list[list[
         assert motion.traj_t is not None
         times = np.linspace(float(motion.traj_t[0]), float(motion.traj_t[-1]), count, endpoint=False)
 
-    ghosts = []
+    if vertices is None:
+        vertices = piece_vertices(pieces)
+
+    # 1) 先算每个时刻所有凸块的世界位姿 / 世界包围盒
+    poses_per_t: list[list] = []
+    boxes_per_t: list[list] = []
     for t in times:
         apply_config(robot, motion.sample(float(t)), joint_index)
-        bodies = create_piece_visuals(pieces, colors, args.ghost_alpha)
-        place_pieces(robot, pieces, bodies)
-        ghosts.append(bodies)
+        cache: dict = {}
+        poses, boxes = [], []
+        for verts, pc in zip(vertices, pieces):
+            pose = link_world_pose(robot, pc.link_index, cache)
+            poses.append(pose)
+            if pose is None or len(verts) == 0:
+                boxes.append(None)
+                continue
+            world = verts @ rot_matrix(pose[1]).T + np.asarray(pose[0], dtype=np.float64)
+            boxes.append((world.min(axis=0), world.max(axis=0)))
+        poses_per_t.append(poses)
+        boxes_per_t.append(boxes)
+
+    # 2) 标记 "会动" 的凸块：世界包围盒变化超过 3 mm
+    moving = [False] * len(pieces)
+    for k in range(len(pieces)):
+        ref = boxes_per_t[0][k]
+        if ref is None:
+            continue
+        for boxes in boxes_per_t[1:]:
+            box = boxes[k]
+            if box is None:
+                continue
+            if (np.abs(box[0] - ref[0]).max() > 0.003
+                    or np.abs(box[1] - ref[1]).max() > 0.003):
+                moving[k] = True
+                break
+
+    # 3) 只给会动的凸块生成残影
+    ghosts: list[list[int]] = []
+    for poses in poses_per_t:
+        group: list[int] = []
+        for k, pc in enumerate(pieces):
+            if not moving[k] or pc.link in skip_links:
+                continue
+            pose = poses[k]
+            if pose is None:
+                continue
+            r, g, b = colors[pc.link]
+            visual = p.createVisualShape(p.GEOM_MESH, fileName=str(pc.obj),
+                                         rgbaColor=[r, g, b, float(args.ghost_alpha)])
+            group.append(p.createMultiBody(baseMass=0.0, baseCollisionShapeIndex=-1,
+                                           baseVisualShapeIndex=visual,
+                                           basePosition=list(pose[0]),
+                                           baseOrientation=list(pose[1])))
+        ghosts.append(group)
+
+    static = list(dict.fromkeys(pc.link for k, pc in enumerate(pieces) if not moving[k]))
     log(f"[残影] {len(ghosts)} 份（t = {', '.join(f'{t:.2f}' for t in times)}），"
-        f"每份 {len(pieces)} 个凸块")
+        f"每份 {sum(moving)} 个会动的凸块")
+    if static:
+        log(f"       {len(static)} 个连杆全程几乎不动，只画当前帧那一份（避免残影叠成一根柱子）: "
+            + ", ".join(static))
     return ghosts
+
+
+def link_label_anchors(pieces, link_index: dict[str, int],
+                       skip=()) -> list[tuple[str, int, np.ndarray]]:
+    """每个连杆取一个标签锚点（该 link 所有凸块质心的平均，link 坐标系）。"""
+    groups: dict[str, list[np.ndarray]] = {}
+    for pc, c in zip(pieces, piece_centroids(pieces)):
+        groups.setdefault(pc.link, []).append(np.asarray(c, dtype=np.float64))
+    out = []
+    for name, pts in groups.items():
+        if name not in link_index or name in skip:
+            continue
+        out.append((name, link_index[name], np.mean(pts, axis=0)))
+    return out
+
+
+def draw_link_labels(robot, anchors, ids: list[int], size: float = 0.7) -> None:
+    """每个连杆名字标在凸块上（replaceItemUniqueId 原地替换，跟随运动）。"""
+    cache: dict = {}
+    while len(ids) < len(anchors):
+        ids.append(-1)
+    for k, (name, link_idx, local) in enumerate(anchors):
+        pose = link_world_pose(robot, link_idx, cache)
+        if pose is None:
+            continue
+        world = np.asarray(pose[0], dtype=np.float64) + rot_matrix(pose[1]) @ local
+        ids[k] = p.addUserDebugText(name, world.tolist(), textColorRGB=[1.0, 1.0, 1.0],
+                                    textSize=float(size), lifeTime=0,
+                                    replaceItemUniqueId=ids[k])
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +855,7 @@ def poll_keys(state: dict) -> None:
 
 
 def run_gui(robot, pieces, joint_index, bodies, configs, times, motion, args,
-            ee_index: int) -> None:
+            ee_index: int, label_anchors=(), text_pos=(0.0, -0.30, 0.02)) -> None:
     """逐帧摆姿势 + 更新坐标系 / 文字，直到用户退出或播完 --loops 遍。"""
     delay = (float(args.cycle_seconds) / max(len(configs), 1)
              if args.cycle_seconds > 0 else 1.0 / max(float(args.fps), 1e-3))
@@ -599,6 +866,7 @@ def run_gui(robot, pieces, joint_index, bodies, configs, times, motion, args,
 
     state = {"pause": False, "quit": False}
     axes_ids: list[int] = []
+    label_ids: list[int] = []
     label_id = -1
     moves = list(zip(configs, times))
     n_done = 0
@@ -620,8 +888,11 @@ def run_gui(robot, pieces, joint_index, bodies, configs, times, motion, args,
                 if args.axes > 0:
                     axes_ids = draw_axes(st[4], st[5], float(args.axes), axes_ids)
 
+            if args.labels and label_anchors:
+                draw_link_labels(robot, label_anchors, label_ids, float(args.label_size))
+
             joint_text = "  ".join(f"{n}={cfg[n]:+.2f}" for n in motion.names[:6])
-            label_id = draw_text(f"t={t:.2f}  {joint_text}", [0.0, -0.30, 0.02], label_id)
+            label_id = draw_text(f"t={t:.2f}  {joint_text}", list(text_pos), label_id)
 
             n_done += 1
             time.sleep(delay)
@@ -641,6 +912,11 @@ def run_gui(robot, pieces, joint_index, bodies, configs, times, motion, args,
 # ---------------------------------------------------------------------------
 # 命令行
 # ---------------------------------------------------------------------------
+def parse_names(text: str) -> list[str]:
+    """--hide base_link,shoulder_link -> ['base_link', 'shoulder_link']"""
+    return [n.strip() for n in str(text).split(",") if n.strip()]
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="凸包运动轨迹查看器：把任意 URDF 的碰撞体拆成凸块，"
@@ -699,7 +975,7 @@ def parse_args(argv=None):
                         help="--robot-mode ghost 时原始网格的透明度")
     g_view.add_argument("--piece-alpha", type=float, default=1.0, help="当前帧凸块的透明度")
     g_view.add_argument("--ghosts", type=int, default=6,
-                        help="整个周期的残影个数（0 = 不画）")
+                        help="整个周期的残影个数（0 = 不画；全程不动的凸块不会重复生成）")
     g_view.add_argument("--ghost-alpha", type=float, default=0.18, help="残影透明度")
     g_view.add_argument("--trail", choices=["link", "piece", "none"], default="link",
                         help="轨迹线：连杆原点 / 凸块质心 / 不画")
@@ -712,8 +988,20 @@ def parse_args(argv=None):
                         help="末端参考连杆名（默认自动：ee_link / tool0 / tcp / ...）")
     g_view.add_argument("--ee-trail", action=argparse.BooleanOptionalAction, default=True,
                         help="画末端参考点的轨迹")
-    g_view.add_argument("--camera", type=lpdm.parse_floats, default="1.8,45,-30,0.35,0,0.35",
-                        help="相机 distance,yaw,pitch,target_x,target_y,target_z")
+    g_view.add_argument("--clearance", type=float, default=0.02,
+                        help="自动抬高：让摆动最低点离地至少这么多米（0 = 不抬高）")
+    g_view.add_argument("--lift", type=float, default=0.0,
+                        help="在自动抬高之外再整体抬高多少米（想让整机悬空看得更清楚时用）")
+    g_view.add_argument("--pedestal", action=argparse.BooleanOptionalAction, default=True,
+                        help="抬高后底座悬空时，画灰色线框支架到地面（默认开）")
+    g_view.add_argument("--labels", action=argparse.BooleanOptionalAction, default=True,
+                        help="在每个连杆的凸块上标出连杆名，方便确认画面里这块是什么")
+    g_view.add_argument("--label-size", type=float, default=0.7, help="连杆名文字大小")
+    g_view.add_argument("--hide", type=parse_names, default=None,
+                        help="把指定连杆的凸块藏掉，逗号分隔：--hide base_link,shoulder_link")
+    g_view.add_argument("--camera", type=lpdm.parse_floats, default=None,
+                        help="相机 distance,yaw,pitch,target_x,target_y,target_z；"
+                             "缺省按整段扫掠范围自动取景")
     g_view.add_argument("--no-ground", action="store_true", help="不画地面")
     ap.set_defaults(trail_closed=True)
     return ap.parse_args(argv)
@@ -782,10 +1070,21 @@ def run(args) -> int:
     except RuntimeError as exc:
         log(f"[error] {exc}")
         return 4
+    motion.calibrate_gripper(robot, joint_index)      # 实测"张开/闭合"是哪个关节值
 
     times = motion.times(args.samples)
     configs = [motion.sample(float(t)) for t in times]
     q_names = sorted(joint_index, key=lambda k: joint_index[k])
+
+    # 2.5) 自动抬高 + 自动取景：保证整个摆动都看得见、不穿地
+    vertices = piece_vertices(pieces)
+    sweep_lo, sweep_hi = swept_bounds(robot, pieces, joint_index, configs, vertices)
+    low_z = float(sweep_lo[2])
+    lift = lift_robot(robot, sweep_lo, args.clearance, args.lift)
+    if lift > 0.0:
+        sweep_lo = sweep_lo + np.array([0.0, 0.0, lift])
+        sweep_hi = sweep_hi + np.array([0.0, 0.0, lift])
+    cam = list(args.camera) if args.camera else auto_camera(sweep_lo, sweep_hi)
 
     log("=" * 100)
     log(f"URDF     : {urdf}")
@@ -804,6 +1103,16 @@ def run(args) -> int:
             f"{len(motion.mimic)} 个 mimic 关节联动）")
     log(f"       轨迹来源: {'程序正弦' if motion.periodic else '外部轨迹'}"
         f"，{len(times)} 帧，t = {times[0]:.3f} .. {times[-1]:.3f}")
+    if lift > 0.0:
+        log(f"[抬高] 摆动最低点 z={low_z:+.3f} m 会穿到地面以下 -> 整机沿 +z 抬高 "
+            f"{lift:.3f} m，现在最低点 z={low_z + lift:+.3f} m"
+            f"（--clearance {args.clearance:g} m）")
+    else:
+        log(f"[抬高] 摆动最低点 z={low_z:+.3f} m，没有穿地 -> 不抬高")
+    log(f"[相机] {'手动 --camera' if args.camera else '自动取景'}: "
+        f"distance={cam[0]:.2f} yaw={cam[1]:.0f} pitch={cam[2]:.0f} "
+        f"target=({cam[3]:+.2f}, {cam[4]:+.2f}, {cam[5]:+.2f})"
+        f"；扫掠范围 {np.round(sweep_lo, 2).tolist()} .. {np.round(sweep_hi, 2).tolist()}")
 
     # 3) 轨迹几何：连杆原点 / 凸块质心 / 末端
     ee_name, ee_index = pick_ee_link(args.ee_link, link_names, link_index)
@@ -832,18 +1141,34 @@ def run(args) -> int:
     # 4) GUI 场景：地面 / 原始网格 / 凸块 / 残影 / 轨迹线
     if not args.no_ground:
         add_ground()
+    base_pos, _ = p.getBasePositionAndOrientation(robot)
+    if lift > 0.0 and args.pedestal:
+        draw_pedestal(base_pos)
+        log(f"[支架] 抬高后底座悬空 {base_pos[2]:.3f} m，画了灰色线框支架（--no-pedestal 去掉）")
 
-    cam = list(args.camera)
     if len(cam) != 6:
-        log(f"[warn] --camera 需要 6 个数，收到 {len(cam)} 个，改用默认相机")
-        cam = [1.8, 45.0, -30.0, 0.35, 0.0, 0.35]
+        log(f"[warn] --camera 需要 6 个数，收到 {len(cam)} 个，改用自动取景")
+        cam = auto_camera(sweep_lo, sweep_hi)
     p.resetDebugVisualizerCamera(float(cam[0]), float(cam[1]), float(cam[2]),
                                  [float(x) for x in cam[3:6]])
 
     style_robot(robot, args.robot_mode, args.robot_alpha)
 
+    hide = set(args.hide or [])
+    unknown = sorted(hide - set(pc.link for pc in pieces))
+    if unknown:
+        log(f"[warn] --hide 里的这些连杆没有凸块，忽略: {', '.join(unknown)}")
+    log("[凸块] 本脚本不添加任何障碍物：画面里所有实心色块都是上表里的连杆凸块"
+        "（--labels 会把连杆名标在块上，--hide 可以逐块关掉）")
+
     bodies = create_piece_visuals(pieces, colors, args.piece_alpha)
-    build_ghosts(robot, pieces, joint_index, colors, motion, args)
+    if hide:
+        for pc, body in zip(pieces, bodies):
+            if pc.link in hide:
+                p.changeVisualShape(body, -1, rgbaColor=[0.5, 0.5, 0.5, 0.0])
+        log(f"[凸块] 已隐藏: {', '.join(sorted(hide & set(pc.link for pc in pieces)))}")
+    build_ghosts(robot, pieces, joint_index, colors, motion, args,
+                 vertices=vertices, skip_links=hide)
 
     idx_to_name = {v: k for k, v in link_index.items()}
     closed = bool(args.trail_closed) and motion.periodic
@@ -866,8 +1191,10 @@ def run(args) -> int:
     # 5) 播放
     apply_config(robot, configs[0], joint_index)
     place_pieces(robot, pieces, bodies)
+    anchors = link_label_anchors(pieces, link_index, skip=hide) if args.labels else []
+    text_pos = (float(sweep_lo[0]), float(sweep_lo[1]) - 0.12, float(sweep_lo[2]))
     run_gui(robot, pieces, joint_index, bodies, configs, times, motion, args,
-            ee_index)
+            ee_index, label_anchors=anchors, text_pos=text_pos)
     return 0
 
 

@@ -1,7 +1,10 @@
-# UR5 + Robotiq 凸块距离计算（V-HACD）
+# UR5 + 铣削电主轴 凸块距离计算（V-HACD）
 
-用 V-HACD 把 UR5 + Robotiq 140 夹爪的 URDF **碰撞网格**拆成若干凸块，让机械臂做正弦运动，
-逐采样点计算 **每个凸块 / 每个连杆到场景中障碍物的最小距离**，并导出 CSV / NPZ。
+用 V-HACD 把 UR5（末端默认是**铣削电主轴 + Ø10 立铣刀**）的 URDF **碰撞网格**拆成若干凸块，
+让机械臂做正弦运动，逐采样点计算 **每个凸块 / 每个连杆到场景中障碍物的最小距离**，并导出 CSV / NPZ。
+
+> 末端执行器全是 fixed 关节，不参与摆动；想换回原来的 Robotiq 2F-140 夹爪只要
+> `--urdf URDF/ur5_robotiq_140.urdf`（两种末端的对照见 §13）。
 
 > 只看"机器人 ↔ 障碍物"的距离，**不计算机器人本体各连杆之间的距离**
 > （那些碰撞体在关节/夹爪处本来就互相重叠，会算出负距离，没有物理意义）。
@@ -13,20 +16,27 @@
 ```
 VHACD/
 ├── link_piece_distance_matrix.py    # 主程序（本文档描述的就是它）
+├── plot_link_distances.py           # 画图：每根手臂连杆的距离-时间 六宫格（§12）
+├── view_convex_trajectory.py        # 凸包运动可视化（§11）
+├── make_spindle_meshes.py           # 生成电主轴 + 铣刀的 STL（§13）
 ├── test_vhacd.py                    # 小工具：在 GUI 里加载 URDF、开线框，肉眼检查碰撞体
 ├── README.md
 ├── URDF/
-│   └── ur5_robotiq_140.urdf         # 唯一被主程序使用的 URDF
+│   ├── ur5_spindle.urdf             # 默认：UR5 + 铣削电主轴 + Ø10 铣刀
+│   └── ur5_robotiq_140.urdf         # 备用：UR5 + Robotiq 2F-140 夹爪（--urdf 指定）
 ├── meshes/
 │   ├── ur5/{collision,visual}/      # URDF 引用的 UR5 网格
+│   ├── spindle/{collision,visual}/  # 电主轴：转接法兰 / 机身 / 前座 / ER20 螺母 / 铣刀
 │   └── robotiq_140/{collision,visual}/
-└── distance_matrix_out/             # 运行后自动生成（默认输出目录）
-    ├── cache/                       # 凸分解缓存（V-HACD 结果 + 每块凸包 OBJ）
-    ├── pieces.csv
-    ├── piece_distance_to_obstacle.csv
-    ├── link_distance_to_obstacle.csv
-    ├── piece_distances_all_samples.csv
-    └── distances.npz
+├── distance_matrix_out/             # 运行后自动生成（默认输出目录）
+│   ├── cache/                       # 凸分解缓存（V-HACD 结果 + 每块凸包 OBJ）
+│   ├── pieces.csv
+│   ├── piece_distance_to_obstacle.csv
+│   ├── link_distance_to_obstacle.csv
+│   ├── piece_distances_all_samples.csv
+│   ├── distances.npz
+│   └── link_distances_over_time.png   # plot_link_distances.py 画的六宫格（§12）
+└── distance_matrix_out_robotiq/     # 换末端之前的夹爪结果（备份，CSV / NPZ 同上）
 ```
 
 `--out-dir` 可以指定到别处；把 `distance_matrix_out/` 删掉也没关系，下次运行会重新生成
@@ -40,13 +50,16 @@ VHACD/
 `/home/thor/miniconda3/envs/ur5_sim/bin/python`。
 
 ```bash
-python link_piece_distance_matrix.py                       # 无窗口，30 个采样点
+python link_piece_distance_matrix.py                       # 无窗口，30 个采样点（电主轴 + 铣刀）
 python link_piece_distance_matrix.py --samples 60 --amp 0.5
 python link_piece_distance_matrix.py --gui                 # 开窗口看机械臂运动
 python link_piece_distance_matrix.py --gui --opengl2 --hold
 python link_piece_distance_matrix.py --recompute           # 忽略缓存重跑 V-HACD
 python link_piece_distance_matrix.py --obstacle-pos 0.4,-0.25,0.2 --obstacle-size 0.1,0.1,0.2
-python link_piece_distance_matrix.py --no-ground --gripper closed --max-distance 0.5
+python link_piece_distance_matrix.py --no-ground --max-distance 0.5
+python link_piece_distance_matrix.py \
+    --urdf URDF/ur5_robotiq_140.urdf --gripper closed \
+    --out-dir /tmp/dm_gripper                             # 换回夹爪（夹爪才会用到 --gripper）
 ```
 
 ---
@@ -86,8 +99,9 @@ q_k(t) = home_k + amp * sin(2*pi*freq*t + k*phase_step)     t = s / samples, s =
 ```
 * `home` 默认 `0,-1.2,1.2,-1.57,-1.57,0`，`amp=0.35 rad`，`freq=1`，
   `phase_step=60°`（相邻关节的相位差，让机械臂做出"拧"的动作而不是整体同步摆）；
-* 夹爪：`--gripper cycle`（`finger_joint` 在上下限之间做正弦，其余 mimic 关节按
-  `multiplier/offset` 联动）、`open`、`closed`。
+* 夹爪（只有夹爪模型才有）：`--gripper cycle`（`finger_joint` 在上下限之间做正弦，其余
+  mimic 关节按 `multiplier/offset` 联动）、`open`、`closed`。电主轴模型的末端全是 fixed
+  关节，不参与摆动，控制台会说明 `--gripper` 不生效。
 
 ### (5) 每个采样点摆位 —— `apply_config()`
 ```
@@ -127,8 +141,8 @@ resetBasePositionAndOrientation(piece_body, pos, orn)   # 把该连杆的凸块�
 | GUI 断开保护 | `--gui` 下按 ESC / 点窗口关闭会让 Bullet 直接退出渲染服务，程序会捕获 `pybullet.error`、保留已算完的采样点并正常退出（退出码 0） |
 
 **精度参考**：把本程序的"凸块 ↔ 障碍物"结果，与直接用 PyBullet 对 URDF 原始连杆碰撞体
-测距的结果对比，19 个连杆的偏差 **平均 0.88 mm、最大 1.54 mm**（来源：1 mm collision margin
-+ V-HACD 近似）。想更精确就调小 `--vhacd-concavity`（更慢）或提高凸包阈值。
+测距的结果对比，夹爪模型（19 个连杆）的偏差 **平均 0.88 mm、最大 1.54 mm**（来源：1 mm collision
+margin + V-HACD 近似）。想更精确就调小 `--vhacd-concavity`（更慢）或提高凸包阈值。
 
 ---
 
@@ -136,31 +150,34 @@ resetBasePositionAndOrientation(piece_body, pos, orn)   # 把该连杆的凸块�
 
 ```
 ====================================================================================================
-URDF     : /home/thor/Desktop/jsm/VHACD/URDF/ur5_robotiq_140.urdf
+URDF     : /home/thor/Desktop/jsm/VHACD/URDF/ur5_spindle.urdf
 PyBullet : 202010061  模式: DIRECT
 
-[凸分解] 19 个 collision 元素 -> 23 个凸块
+[凸分解] 13 个 collision 元素 -> 17 个凸块
   base_link                  base.stl                                 V-HACD 1 pcs (ratio=0.850)
   upper_arm_link             upperarm.stl                             V-HACD 3 pcs (ratio=0.685)
   forearm_link               forearm.stl                              V-HACD 3 pcs (ratio=0.645)
   ee_link                    box [0.01, 0.01, 0.01]                   1 pcs (box)
-  robotiq_arg2f_base_link    robotiq_arg2f_base_link.stl              already convex (ratio=1.000)
-  left_inner_finger_pad      box [0.03, 0.07, 0.008]                  1 pcs (box)
-  ...
+  spindle_mount_link         spindle_mount.stl                        already convex (ratio=1.000)
+  spindle_link               spindle_body.stl                         already convex (ratio=1.000)
+  spindle_link               spindle_nose.stl                         already convex (ratio=1.000)
+  spindle_link               spindle_collet_nut.stl                   already convex (ratio=1.000)
+  tool_link                  milling_tool.stl                         already convex (ratio=1.000)
 
-[场景] 机器人凸块 23 个；障碍物 [12.0, 12.0, 30.0] cm @ [0.45, -0.3, 0.15] m（1 个凸块）
+[场景] 机器人凸块 17 个；障碍物 [12.0, 12.0, 30.0] cm @ [0.45, -0.3, 0.15] m（1 个凸块）
 [测距] 只计算 机器人凸块 <-> 障碍物；机器人本体各连杆之间不测距
        连杆/凸块数: base_link:1, shoulder_link:1, upper_arm_link:3, forearm_link:3, ...
 
 [运动] 手臂关节: shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint
        q_k(t) = home_k + 0.35 * sin(2*pi*1.0*t + k*60.0deg), t = 0..1 均匀取 30 点
-       夹爪: cycle（finger_joint + 5 个 mimic 关节联动）
+[末端] ee_link 下游（固定工具）: spindle_mount_link, spindle_link, tool_link（5 个凸块）
+       末端没有可开合的夹爪关节，--gripper cycle 不生效（要算夹爪开合请 --urdf ur5_robotiq_140.urdf）
 
 [  1/30] t=0.000  最近连杆: forearm_link               0.2016 m
-[  2/30] t=0.033  最近连杆: left_inner_finger_pad      0.2432 m
+[  2/30] t=0.033  最近连杆: forearm_link               0.2448 m
 ...
 [ 26/30] t=0.833  最近连杆: forearm_link               0.0548 m
-[耗时] 0.07 s / 30 个采样点
+[耗时] 0.03 s / 30 个采样点
 
 [输出目录] /home/thor/Desktop/jsm/VHACD/distance_matrix_out
   pieces.csv                          凸块索引 / 标签 / 所属连杆
@@ -179,12 +196,17 @@ PyBullet : 202010061  模式: DIRECT
   forearm_link                 3       0.2016     0.0548   0.833  forearm_link#p2
   wrist_1_link                 1       0.3053     0.1446   0.833  wrist_1_link#p0
   ...
-  left_outer_finger            1       0.2027     0.1140   0.867  left_outer_finger#p0
-  right_inner_finger_pad       1       0.3262     0.2458   0.767  right_inner_finger_pad#p0
+  spindle_mount_link           1       0.2979     0.1320   0.800  spindle_mount_link#p0
+  spindle_link                 3       0.2356     0.1376   0.800  spindle_link#p0
+  tool_link                    1       0.2714     0.2117   0.867  tool_link#p0
   -> 全程最近: forearm_link  0.0548 m @ t=0.833（forearm_link#p2）
 --------------------------------------------------------------------------------------------
 [全程最近凸块] forearm_link#p2  0.0548 m
 ```
+
+> 换成夹爪模型（`--urdf URDF/ur5_robotiq_140.urdf`）时会多出 `robotiq_arg2f_base_link`、
+> 各手指/指节/衬垫共 19 个连杆、23 个凸块，并多打印一行
+> `夹爪: cycle（finger_joint + 5 个 mimic 关节联动）`。
 
 * 每个采样点一行：`t` + 当前**最近连杆**及其距离（用来知道进度）；
 * 表格列：`pcs` 该连杆的凸块数，`d(t=0)` 第 0 个采样点的距离，
@@ -199,14 +221,14 @@ PyBullet : 202010061  模式: DIRECT
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--urdf` | `URDF/ur5_robotiq_140.urdf` | URDF 路径 |
+| `--urdf` | `URDF/ur5_spindle.urdf` | URDF 路径；夹爪模型用 `URDF/ur5_robotiq_140.urdf` |
 | `--out-dir` | `./distance_matrix_out` | 输出目录（`cache/` 也在里面） |
 | `--samples` | `30` | 一个运动周期内的采样点数 |
 | `--home` | `0,-1.2,1.2,-1.57,-1.57,0` | 6 个手臂关节的基准角 (rad) |
 | `--amp` | `0.35` | 正弦幅值 (rad) |
 | `--freq` | `1.0` | 一个采样周期内的正弦周期数 |
 | `--phase-step` | `60.0` | 相邻手臂关节的相位差 (deg) |
-| `--gripper` | `cycle` | `cycle` / `open` / `closed` |
+| `--gripper` | `cycle` | `cycle` / `open` / `closed`（URDF 里没有夹爪关节时无效，电主轴模型就是这种情况） |
 | `--max-distance` | `5.0` | 测距上限，更远记为该值 (m) |
 | `--convex-ratio` | `0.99` | 体积/凸包体积 ≥ 该值就当作已经凸，跳过 V-HACD |
 | `--vhacd-concavity` | `0.002` | V-HACD 最大凹度（越小越贴近原网格、块越多） |
@@ -364,7 +386,8 @@ for ln, col in zip(links, link_d.T):
 |---|---|
 | 换个障碍物 | `--obstacle-pos x,y,z`、`--obstacle-size L,W,H`、`--obstacle-rpy r,p,y`（同一个 box 刚体，不是多个） |
 | 让机械臂扫更大的范围 | 加大 `--amp`（例如 0.6），或换 `--home` 把起始姿态放到障碍物附近 |
-| 只看夹爪闭合时的距离 | `--gripper closed`（此时夹爪关节固定，其余 6 轴仍在动） |
+| 只看夹爪闭合时的距离 | `--gripper closed`（需要夹爪模型：`--urdf URDF/ur5_robotiq_140.urdf`；此时夹爪关节固定，其余 6 轴仍在动） |
+| 换成铣削末端 | 默认就是（`URDF/ur5_spindle.urdf`，见 §13）；自己改刀具尺寸就改 `make_spindle_meshes.py` 里的 `TOOL_R / SHANK_T / FLUTE_T` 再重跑它 |
 | 采集更多时刻 | `--samples 100`（代价线性增长，30 点只要 0.07 s，可以放心加大） |
 | 只关心近处（跑得快些） | `--max-distance 0.3`，远处的接触对直接被 Bullet 剪掉 |
 | 想要更精确的几何 | 调小 `--vhacd-concavity 0.001` + `--max-vertices-per-ch 128` + `--recompute`（块变多、变慢） |
@@ -390,7 +413,8 @@ GUI 窗口被关掉了（点 X 或按 ESC）。这类操作会让 Bullet 直接�
 **Q4. 数值和"直接用 URDF 原始碰撞体测距"差 1~2 mm？**
 两个来源：Bullet 默认 1 mm collision margin（本程序已置 0，但原始 URDF 测距没置），
 以及 V-HACD 对凹网格的近似（凸包比原网格略"胖/瘦"）。
-实测 19 个连杆平均差 0.88 mm、最大 1.54 mm，属于正常范围。
+实测夹爪模型 19 个连杆平均差 0.88 mm、最大 1.54 mm，属于正常范围
+（电主轴 + 铣刀的零件本身都是凸的，走的是"直接取凸包"分支，误差只来自采样/离散化）。
 
 **Q5. 没有显示器，加了 `--gui` 会怎样？**
 检测不到 `$DISPLAY` / `$WAYLAND_DISPLAY` 时直接退回 `DIRECT`（会打印一条 `[warn]`），照常算完。
@@ -414,7 +438,8 @@ GUI 窗口被关掉了（点 X 或按 ESC）。这类操作会让 Bullet 直接�
 # 1) 语法检查
 python -m py_compile link_piece_distance_matrix.py
 
-# 2) 无窗口跑一遍：应打印 19 个连杆 / 23 个凸块，距离全部 >= 0
+# 2) 无窗口跑一遍：应打印 11 个连杆 / 17 个凸块，距离全部 >= 0
+#    （换成夹爪模型是 19 个连杆 / 23 个凸块）
 python link_piece_distance_matrix.py --samples 30
 
 # 3) 检查输出（第一行都是表头，行数 = 连杆数 / 凸块数）
@@ -443,12 +468,35 @@ python link_piece_distance_matrix.py --obstacle-pos 0,0,0.05 --samples 5 --out-d
 | 轨迹线 | `--trail link/piece/none`、`--trail-width` | 连杆原点 / 凸块质心的折线（点太多会自动抽稀） |
 | 末端轨迹 | `--ee-trail`、`--ee-link` | 自动找 `ee_link` / `tool0` / `tcp`… |
 | 动坐标系 | `--axes 0.06` | 每帧在末端画 RGB 轴，看姿态变化 |
+| 连杆名标签 | `--labels`、`--label-size` | 把连杆名直接标在它的凸块上（默认开），用来确认 "画面里这块是什么" |
+| 临时隐藏 | `--hide base_link,shoulder_link` | 把指定连杆的凸块藏掉，配合标签排查遮挡 |
+| 自动抬高 | `--clearance 0.02`、`--lift`、`--pedestal` | 摆动最低点离地不足 `--clearance` 时整机沿 +z 抬高，底座悬空处画灰色线框支架 |
+| 相机 | `--camera`、默认自动取景 | 缺省按整段扫掠包围盒自动算 distance/target，整段摆动都在画面里 |
+
+> **关于基座旁边那块"奇怪的柱子"**：进画面里的东西只有三类 —— 地面、原始 URDF
+> 网格（`--robot-mode`）、每个连杆的凸块（按连杆上色）。脚本**不会**添加任何障碍物。
+> 早期版本里 `base_link`（底座圆盘）在每个残影时刻都画一份，6 份半透明网格叠在
+> 同一个位置，看起来就像底座上竖着一根深色柱子。现在全程几乎不动的凸块
+> （世界包围盒变化 < 3 mm）只画当前帧那一份，柱子就消失了；日志里会写明
+> 哪些连杆被判定为"不动"。`--labels` / `--hide` 可以进一步确认。
+>
+> **关于夹爪初始化是不是"合拢"**（只在夹爪模型下出现）：脚本会先实测两端的指尖间距，
+> 间距大的那端才算"张开"（本仓库的 UR5 + Robotiq 140 是 `finger_joint=0` 张开、
+> `0.7` 闭合，和其它 URDF 的约定可能相反）。日志会打印 `张开=... 闭合=... 起始位姿 t=0 -> 张开`，
+> 默认 `--gripper cycle` 从张开开始摆到闭合再张开。默认的电主轴 + 铣刀没有可动夹爪，
+> 这一段会被跳过。
 
 ### 11.2 常用命令
 
 ```bash
-# 默认：UR5 + 正弦摆动，带残影 + 连杆轨迹线
+# 默认：UR5 + 正弦摆动，带残影 + 连杆轨迹线（自动抬高，保证不穿地）
 python view_convex_trajectory.py
+
+# 不要线框支架 / 不要连杆名标签，画面更干净
+python view_convex_trajectory.py --no-pedestal --no-labels
+
+# 抬高多少不合适就微调：--clearance 离地间隙，--lift 额外再抬
+python view_convex_trajectory.py --clearance 0.05 --lift 0.10
 
 # 换机器人：只改 --urdf；幅值按各自行程自动取 40%，不用调参数
 python view_convex_trajectory.py --urdf ../other_robot.urdf --amp-frac 0.4
@@ -464,19 +512,163 @@ python view_convex_trajectory.py --headless --save-traj /tmp/traj.csv
 python view_convex_trajectory.py --traj /tmp/traj.csv
 ```
 
-### 11.3 换机器人要注意的三件事
+### 11.3 换机器人要注意的四件事
 
 1. `--urdf` 里的 `<mesh filename>` 必须是相对 URDF 的路径（PyBullet 不认 `package://`）；
 2. 关节数、限位、mimic 全从 URDF 读，**不需要**改代码；基准位姿缺省是每个关节
    `clamp(0, lower, upper)`，想摆成别的样子用 `--home`（个数 = 可动关节数，不含夹爪）；
-3. 夹爪/末端关节自动识别为"mimic 的父关节"或名字带 `finger`/`knuckle` 的关节，
-   由 `--gripper cycle/open/closed` 驱动，其余关节做正弦摆动。
+3. 夹爪/末端关节自动识别为"mimic 的父关节"或名字带 `finger`/`knuckle`/`spindle`/`chuck`/
+   `mill`/`cutter`/`tool` 的关节，夹爪由 `--gripper cycle/open/closed` 驱动（电主轴模型
+   没有这类关节，就只摆 6 个手臂轴）；
+4. 画面会自动抬高 / 取景：先算出整段轨迹所有凸块顶点的世界包围盒，最低点离地
+   不足 `--clearance` 就把基座沿 +z 抬起（固定基座只改基座位姿，运动链整条跟着上），
+   相机再按包围盒自动算 distance / target，所以摆动的最低点、最高点都在画面里。
+   抬高后底座是悬空的，默认会画灰色线框支架到地面，不想要就 `--no-pedestal`，
+   想完全不抬高就 `--clearance 0`。
 
 ### 11.4 自检（无显示器 / CI）
 
 ```bash
 python -m py_compile view_convex_trajectory.py
-# 应打印 19 个连杆 / 23 个凸块，并给出每个连杆原点的轨迹包围盒与路程
+# 应打印 11 个连杆 / 17 个凸块（夹爪模型是 19 / 23），并给出每个连杆原点的轨迹包围盒与路程
 python view_convex_trajectory.py --headless --samples 24
+```
+
+---
+
+## 12. 距离曲线图（`plot_link_distances.py`）
+
+`piece_distances_all_samples.csv` 的表格不好"看出"哪根杆什么时候贴得最近，
+这个脚本把它画成 **6 张 距离-时间 曲线**（一图一根手臂连杆，不含基座、不含末端执行器）：
+
+```
+shoulder_link   upper_arm_link   forearm_link
+wrist_1_link    wrist_2_link     wrist_3_link
+```
+
+它读的就是 §7.4 的 CSV：**同一时刻对该连杆的所有凸块取 min** 得到 `d_link(t)`
+（与 `link_distance_to_obstacle.csv` 算法一致，所以最小值能对上）。
+不需要 PyBullet，也不需要 `$DISPLAY`（默认用 Agg 后端存 PNG）。
+
+```bash
+python plot_link_distances.py                  # -> distance_matrix_out/link_distances_over_time.png
+python plot_link_distances.py --show           # 画完弹窗（需要 $DISPLAY）
+python plot_link_distances.py --warn 0.1       # 警戒线改成 10 cm（默认 5 cm）
+python plot_link_distances.py --no-pieces      # 只看连杆 min，不叠加各凸块的细灰线
+python plot_link_distances.py --no-shared-y    # 每个子图各自缩放纵轴（默认共用一把尺子）
+python plot_link_distances.py --lang en --dpi 200 --out /tmp/d.png
+python plot_link_distances.py --links forearm_link,wrist_1_link   # 只看指定连杆
+python plot_link_distances.py --save-csv /tmp/link_d_vs_t.csv     # 顺带导出 行=连杆 的聚合表
+```
+
+![link distances](distance_matrix_out/link_distances_over_time.png)
+
+每张图里：**粗彩线** = 该连杆 `d_link(t)`；**细灰线** = 该连杆各凸块自己的曲线
+（例如 forearm 有三块，能看出最危险的是 `#p2`）；**灰虚线** = 警戒距离；
+**圆点 + 标注** = 全程最小值及其时刻 `t`。默认 6 张图共用纵轴，方便横向比较
+"谁更危险"；要看单根杆的细节就加 `--no-shared-y`。
+
+控制台同时打印汇总表（和 `link_distance_to_obstacle.csv` 一致的列），当前数据：
+
+```
+  link                         d(t=0)   min [m]   t_min  closest piece
+  shoulder_link                0.3959    0.3956   0.033  shoulder_link#p0
+  upper_arm_link               0.3287    0.3072   0.933  upper_arm_link#p0
+  forearm_link                 0.2016    0.0548   0.833  forearm_link#p2
+  wrist_1_link                 0.3053    0.1446   0.833  wrist_1_link#p0
+  wrist_2_link                 0.3248    0.1379   0.800  wrist_2_link#p0
+  wrist_3_link                 0.3114    0.1368   0.800  wrist_3_link#p0
+```
+
+> 依赖：只在画图时才用到 `matplotlib`（`python -m pip install matplotlib`），
+> 主程序 `link_piece_distance_matrix.py` 不依赖它。中文字体自动找
+> `Noto Sans CJK / 文泉驿 / 微软雅黑`，一个都没有时图上自动改英文（`--lang en` 可强制）。
+> `--links` 点名后不再做"排除基座/末端"的过滤，所以想画 `base_link`、
+> 夹爪或 `spindle_link` / `tool_link` 直接写名字即可。
+
+自检：
+
+```bash
+python -m py_compile plot_link_distances.py
+python plot_link_distances.py            # 应打印 6 根连杆的汇总表 + [输出] PNG: ...
+```
+
+
+---
+
+## 13. 末端执行器：铣削电主轴 + Ø10 铣刀
+
+仓库里的末端执行器已经从 Robotiq 2F-140 夹爪换成了"铣削加工用的电主轴 + 立铣刀"。
+所有网格都由 `make_spindle_meshes.py` 用 numpy 现场生成（纯程序建模，不需要 CAD 或网格库）：
+
+```bash
+python make_spindle_meshes.py     # 重写 meshes/spindle/{visual,collision}/*.stl
+```
+
+| 零件 | mesh | 尺寸 | 挂在哪个 link |
+|---|---|---|---|
+| 转接法兰 | `spindle_mount.stl` | Ø88 × 14 mm | `spindle_mount_link`（贴 `ee_link` 端面） |
+| 机身 | `spindle_body.stl` | Ø80 × 200 mm | `spindle_link`（后面 14 mm 被法兰挡住） |
+| 前轴承座 | `spindle_nose.stl` | Ø60 × 22 mm | `spindle_link` |
+| ER20 夹头螺母 | `spindle_collet_nut.stl` | Ø34 × 17 mm | `spindle_link` |
+| 立铣刀 | `milling_tool.stl` | Ø10 × 72 mm（柄 40 + 刃 32） | `tool_link`（刀尖在 z = +72 mm） |
+
+运动链（全是 fixed 关节，不参与正弦摆动）：
+
+```
+wrist_3_link --ee_fixed_joint-------> ee_link
+             --spindle_mount_joint--> spindle_mount_link   (xyz 0 0 0)
+             --spindle_body_joint---> spindle_link         (xyz 0 0 0.014)
+             --milling_tool_joint---> tool_link            (xyz 0 0 0.239)
+```
+
+也就是**从 `ee_link` 端面算起：主轴 253 mm + 刀具 72 mm，刀尖伸出 325 mm**，方向与原来的夹爪
+一致（沿 `ee_link` 的 +x；URDF 里用 `rpy="-1.57 1.57 -1.57"` 把主轴轴心转过去，
+与 Robotiq 的安装坐标系相同，所以两套末端的位姿可以直接对比）。
+
+两个设计约定：
+
+1. **末端不参与运动**：`Motion` 只摆 6 个手臂关节，`is_gripper_joint()` 会排除
+   `*finger* / *knuckle* / *spindle* / *collet* / *chuck* / *mill* / *cutter* / *tool*`，
+   所以主轴不会跟着正弦"摇头"，`--home` 仍然是 6 个数；`--gripper` 对这套模型无效
+   （控制台会打印"[末端] 末端没有可开合的夹爪关节"）。
+2. **碰撞网格拆成 3 个凸的 `<collision>`**：机身 / 前座 / 螺母各一个，凸分解时直接取凸包
+   （`ratio=1.000`，跳过 V-HACD），避免"整体网格的凸包把 Ø34 螺母撑成 Ø80"的过估计。
+   法兰和铣刀本身也是凸的，各 1 块 —— 末端一共 5 个凸块。
+
+当前末端的测距结果（默认场景 / 30 采样点，来自 `link_distance_to_obstacle.csv`）：
+
+```
+link                 pcs   d(t=0)   min [m]   t_min
+spindle_mount_link     1   0.2979    0.1320   0.800
+spindle_link           3   0.2356    0.1376   0.800
+tool_link              1   0.2714    0.2117   0.867
+```
+
+要换回夹爪（含开合动作）：
+
+```bash
+python link_piece_distance_matrix.py --urdf URDF/ur5_robotiq_140.urdf --gripper cycle
+```
+
+换末端之前的夹爪结果备份在 `distance_matrix_out_robotiq/`（同格式 CSV / NPZ），方便对照。
+六宫格 PNG 只画 6 根手臂连杆、跟末端无关，所以夹爪版和主轴版是同一张图（就是
+`distance_matrix_out/link_distances_over_time.png`）；要在备份目录里单独再画一份：
+
+```bash
+python plot_link_distances.py --csv distance_matrix_out_robotiq/piece_distances_all_samples.csv \
+                              --out distance_matrix_out_robotiq/link_distances_over_time.png
+```
+
+> 注意：默认 `--home 0,-1.2,1.2,-1.57,-1.57,0` + `--amp 0.35` 的摆动会让刀尖在部分时刻
+> 钻到 z = 0 的视觉地面以下（最低约 -0.19 m）。地面只是个视觉平面（`--no-ground` 可关掉），
+> 不参与测距；想在 GUI 里看得舒服，可以调小 `--amp`、抬高 `--home`，或把工作台放到刀下方。
+
+自检：
+
+```bash
+python make_spindle_meshes.py                            # 5 个零件 × 2 份，每个都应打印"封闭（N 条边）"
+python link_piece_distance_matrix.py                     # 应打印 11 个连杆 / 17 个凸块（末端 5 块）
+python view_convex_trajectory.py --headless --samples 8  # 凸块跟着刀尖走是否正常
 ```
 

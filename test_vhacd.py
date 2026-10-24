@@ -1,13 +1,14 @@
 import pybullet as p
 import time
+from pathlib import Path
 
 def load_my_urdf():
     # 将原来的 p.connect(p.GUI) 替换为：
     p.connect(p.GUI, options="--opengl2")
     p.setGravity(0, 0, -9.81)
     
-    # ⚠️ 把这里换成你自己的 URDF 绝对路径！
-    my_urdf_path = "/home/thor/Desktop/jsm/VHACD/URDF/ur5_robotiq_140.urdf"
+    # 默认加载仓库当前的末端（电主轴 + 铣刀）；想看夹爪就换成 ur5_robotiq_140.urdf
+    my_urdf_path = str(Path(__file__).resolve().parent / "URDF" / "ur5_spindle.urdf")
     
     print(f"正在加载: {my_urdf_path}")
     
